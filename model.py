@@ -49,7 +49,7 @@ class QTrainer:
             action = torch.unsqueeze(action, 0)
             reward = torch.unsqueeze(reward, 0)
             done = (done, )
-
+ 
         pred = self.model(state)
 
         target = pred.clone()
