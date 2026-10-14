@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 train_*.log
+
+# Report (kept locally, not in git)
+REPORT.pdf
+REPORT.html
+report/
