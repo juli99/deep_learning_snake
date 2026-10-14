@@ -6,3 +6,7 @@ train_*.log
 REPORT.pdf
 REPORT.html
 report/
+
+# Resume state is large and local
+runs/*/checkpoint.pth
+runs/*/checkpoint_buffer.npz

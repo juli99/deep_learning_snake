@@ -48,6 +48,17 @@ class ReplayBuffer:
         self.pos = (self.pos + n) % self.cap
         self.size = min(self.size + n, self.cap)
 
+    def save(self, path):
+        n = self.size
+        np.savez(path, s=self.s[:n], s2=self.s2[:n], a=self.a[:n], r=self.r[:n], d=self.d[:n],
+                 pos=self.pos, size=self.size)
+
+    def load(self, path):
+        z = np.load(path)
+        n = int(z["size"])
+        self.s[:n], self.s2[:n], self.a[:n], self.r[:n], self.d[:n] = z["s"], z["s2"], z["a"], z["r"], z["d"]
+        self.pos, self.size = int(z["pos"]), n
+
     def sample(self, batch, rng):
         idx = rng.integers(0, self.size, batch)
         return (torch.from_numpy(self.s[idx]), torch.from_numpy(self.a[idx]), torch.from_numpy(self.r[idx]),
@@ -95,6 +106,26 @@ class DQNAgent:
 
     def save(self, path, **meta):
         torch.save({"model_state": self.q.state_dict(), "hparams": self.hparams, **meta}, path)
+
+    def save_checkpoint(self, path, **meta):
+        """Everything needed to resume training: both networks, optimizer, RNG and replay buffer."""
+        path = str(path)
+        torch.save({"model_state": self.q.state_dict(), "target_state": self.q_target.state_dict(),
+                    "opt_state": self.opt.state_dict(), "hparams": self.hparams,
+                    "rng_state": self.rng.bit_generator.state, "torch_rng": torch.get_rng_state(), **meta}, path)
+        self.buffer.save(path.replace(".pth", "_buffer.npz"))
+
+    def load_checkpoint(self, path):
+        """Restore a save_checkpoint() file into this agent; returns the stored metadata."""
+        path = str(path)
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+        self.q.load_state_dict(ck["model_state"])
+        self.q_target.load_state_dict(ck["target_state"])
+        self.opt.load_state_dict(ck["opt_state"])
+        self.rng.bit_generator.state = ck["rng_state"]
+        torch.set_rng_state(ck["torch_rng"])
+        self.buffer.load(path.replace(".pth", "_buffer.npz"))
+        return ck
 
     @staticmethod
     def load_policy(path):

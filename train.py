@@ -1,16 +1,22 @@
 """
 train.py — fast training: many Snake games in parallel, headless, Double DQN.
 
-    python train.py                          # 64 games in parallel, 1.5M moves
+    python train.py                          # 64 games in parallel, 1M moves
     python train.py --envs 128 --steps 3e6   # more games / longer
     python train.py --view                   # also watch 9 of the games (split screen)
     python train.py --view --show 16         # watch 16 games
+    python train.py --resume runs/main       # continue a stopped run from where it stopped
+    python train.py --resume runs/main --steps 3e6   # continue and train longer than planned
 
 Every step, all games move at once: the network picks actions for the whole
 batch, every game's move goes into the replay buffer, and the network does one
 gradient step. Output (in runs/<name>/):
-    best.pth      network with the best average score over the last 200 games
+    best.pth      network with the best greedy-evaluation score (no random moves)
     last.pth      network at the end
+    checkpoint.pth + checkpoint_buffer.npz
+                  full training state (both networks, optimizer, replay buffer,
+                  step counter), saved at every evaluation, at the end and on
+                  Ctrl+C. --resume continues from it.
     log.csv       one line per finished game
     progress.png  learning curve (average score vs. games and vs. time)
 """
@@ -48,6 +54,7 @@ def parse():
     ap.add_argument("--eval-games", type=int, default=50)
     ap.add_argument("--features", type=int, default=N_FEATURES, choices=[11, N_FEATURES],
                     help="11 = only the original sensors (for comparison), 16 = with flood-fill sensors")
+    ap.add_argument("--resume", default=None, help="run folder to continue (uses its checkpoint.pth)")
     return ap.parse_args()
 
 
@@ -97,85 +104,136 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     args = parse()
     torch.set_num_threads(args.threads)
-    run = Path("runs") / (args.name or time.strftime("%Y%m%d-%H%M%S"))
+
+    # Resuming: settings that define the run come from the checkpoint, not the command line
+    ck = None
+    if args.resume:
+        run = Path(args.resume)
+        if not (run / "checkpoint.pth").exists():
+            sys.exit(f"No checkpoint.pth in {run} — nothing to resume.")
+        ck = torch.load(run / "checkpoint.pth", map_location="cpu", weights_only=False)
+        hp = ck["hparams"]
+        args.features, args.lr, args.gamma, args.batch = hp["n_features"], hp["lr"], hp["gamma"], hp["batch_size"]
+        args.envs, args.seed = ck["envs"], ck["seed"]
+    else:
+        run = Path("runs") / (args.name or time.strftime("%Y%m%d-%H%M%S"))
     run.mkdir(parents=True, exist_ok=True)
 
-    env = VecSnakeEnv(n_envs=args.envs, seed=args.seed)
     nf = args.features
     agent = DQNAgent(nf, lr=args.lr, gamma=args.gamma, batch_size=args.batch, seed=args.seed)
+    total_steps = int(args.steps)
+    iters = total_steps // args.envs
+    eps_iters = int(args.eps_frac * iters)
+    games_log, best_avg, record, start_it, prev_seconds = [], -1.0, 0, 0, 0.0
+
+    if ck is not None:
+        agent.load_checkpoint(run / "checkpoint.pth")
+        start_it, eps_iters = ck["it"], ck["eps_iters"]
+        best_avg, record, prev_seconds = ck["best_avg"], ck["record"], ck["seconds"]
+        with open(run / "log.csv", newline="") as f:
+            rows = list(csv.reader(f))[1:]
+        # log.csv may hold games played after the last checkpoint; those are dropped
+        games_log = [(int(g), int(m), int(s), float(e), float(t)) for g, m, s, e, t in rows][:ck["games"]]
+        if start_it >= iters:
+            sys.exit(f"Run already has {start_it * args.envs:,} moves; pass a larger --steps to train longer.")
+        print(f"Resuming {run} from move {start_it * args.envs:,} (best eval {best_avg:.1f}, record {record})")
+
+    # A fresh board for every game; finished/partial games are not part of the saved state
+    env = VecSnakeEnv(n_envs=args.envs, seed=args.seed + start_it)
     view = None
     if args.view:
         from split_view import SplitView
         view = SplitView(env, n_show=args.show, title="Snake — training (split screen)")
 
-    total_steps = int(args.steps)
-    iters = total_steps // args.envs
-    eps_iters = int(args.eps_frac * iters)
-    games_log, best_avg, record = [], -1.0, 0
     obs = env.observe()[:, :nf]
-    t0 = t_print = time.time()
+    t_print = time.time()
+    t0 = t_print - prev_seconds
     log_f = open(run / "log.csv", "w", newline="")
     log = csv.writer(log_f)
     log.writerow(["game", "move", "score", "epsilon", "seconds"])
+    log.writerows(games_log)
     eval_every = int(args.eval_every)
-    eval_f = open(run / "eval.csv", "w", newline="")
+    eval_mode = "a" if ck is not None else "w"
+    eval_f = open(run / "eval.csv", eval_mode, newline="")
     evals = csv.writer(eval_f)
-    evals.writerow(["moves", "seconds", "greedy_mean"])
+    if ck is None:
+        evals.writerow(["moves", "seconds", "greedy_mean"])
+
+    def checkpoint(it):
+        """Save everything needed by --resume; `it` = number of finished iterations."""
+        agent.save_checkpoint(run / "checkpoint.pth", it=it, eps_iters=eps_iters, envs=args.envs, seed=args.seed,
+                              games=len(games_log), best_avg=best_avg, record=record, seconds=time.time() - t0)
+        log_f.flush()
+        eval_f.flush()
 
     print(f"Training {args.envs} games in parallel for {total_steps:,} moves → {run}")
-    for it in range(iters):
-        eps = max(args.eps_end, args.eps_start - (args.eps_start - args.eps_end) * it / max(1, eps_iters))
-        actions = agent.act(obs, eps)
-        rewards, dones, final = env.step(actions)
-        next_obs = env.observe()[:, :nf]
-        agent.buffer.add_batch(obs, actions, rewards, next_obs, dones.astype(np.float32))
-        obs = next_obs
+    it = start_it
+    try:
+        for it in range(start_it, iters):
+            eps = max(args.eps_end, args.eps_start - (args.eps_start - args.eps_end) * it / max(1, eps_iters))
+            actions = agent.act(obs, eps)
+            rewards, dones, final = env.step(actions)
+            next_obs = env.observe()[:, :nf]
+            agent.buffer.add_batch(obs, actions, rewards, next_obs, dones.astype(np.float32))
+            obs = next_obs
 
-        if agent.buffer.size >= args.warmup:
-            agent.learn()
+            if agent.buffer.size >= args.warmup:
+                agent.learn()
 
-        now = time.time()
-        for sc in final[dones]:
-            record = max(record, int(sc))
-            games_log.append((len(games_log) + 1, (it + 1) * args.envs, int(sc), round(eps, 4), round(now - t0, 1)))
-            log.writerow(games_log[-1])
+            now = time.time()
+            for sc in final[dones]:
+                record = max(record, int(sc))
+                games_log.append((len(games_log) + 1, (it + 1) * args.envs, int(sc), round(eps, 4), round(now - t0, 1)))
+                log.writerow(games_log[-1])
 
-        moves = (it + 1) * args.envs
-        if moves // eval_every != (moves - args.envs) // eval_every and agent.buffer.size >= args.warmup:
-            score = greedy_eval(agent, nf, args.eval_games)
-            evals.writerow([moves, round(now - t0, 1), round(score, 2)])
-            eval_f.flush()
-            print(f"  greedy eval at {moves:,} moves: mean {score:.1f} over {args.eval_games} games", flush=True)
-            if score > best_avg:
-                best_avg = score
-                agent.save(run / "best.pth", games=len(games_log), moves=moves, eval_mean=score,
-                           record=record, seconds=now - t0)
-
-        if view is not None and it % args.view_every == 0:
-            if not view.handle_events():
-                view.close()
-                view = None
-            else:
-                avg_now = np.mean([g[2] for g in games_log[-200:]]) if games_log else 0
-                view.draw(f"games {len(games_log):,}   avg(200) {avg_now:.1f}   record {record}   ε {eps:.2f}")
-
-        if now - t_print > 10:
-            t_print = now
             moves = (it + 1) * args.envs
-            avg_now = np.mean([g[2] for g in games_log[-200:]]) if games_log else 0
-            print(f"{now - t0:6.0f}s  moves {moves:>10,}  ({moves / (now - t0):7,.0f}/s)  games {len(games_log):>7,}  "
-                  f"avg(200) {avg_now:5.1f}  best eval {best_avg:5.1f}  record {record:3d}  ε {eps:.3f}", flush=True)
-            log_f.flush()
+            if moves // eval_every != (moves - args.envs) // eval_every and agent.buffer.size >= args.warmup:
+                score = greedy_eval(agent, nf, args.eval_games)
+                evals.writerow([moves, round(now - t0, 1), round(score, 2)])
+                eval_f.flush()
+                print(f"  greedy eval at {moves:,} moves: mean {score:.1f} over {args.eval_games} games", flush=True)
+                if score > best_avg:
+                    best_avg = score
+                    agent.save(run / "best.pth", games=len(games_log), moves=moves, eval_mean=score,
+                               record=record, seconds=now - t0)
+                checkpoint(it + 1)
 
-    log_f.close()
+            if view is not None and it % args.view_every == 0:
+                if not view.handle_events():
+                    view.close()
+                    view = None
+                else:
+                    avg_now = np.mean([g[2] for g in games_log[-200:]]) if games_log else 0
+                    view.draw(f"games {len(games_log):,}   avg(200) {avg_now:.1f}   record {record}   ε {eps:.2f}")
+
+            if now - t_print > 10:
+                t_print = now
+                moves = (it + 1) * args.envs
+                avg_now = np.mean([g[2] for g in games_log[-200:]]) if games_log else 0
+                print(f"{now - t0:6.0f}s  moves {moves:>10,}  ({moves / (now - t0):7,.0f}/s)  games {len(games_log):>7,}  "
+                      f"avg(200) {avg_now:5.1f}  best eval {best_avg:5.1f}  record {record:3d}  ε {eps:.3f}", flush=True)
+                log_f.flush()
+    except KeyboardInterrupt:
+        # The iteration that was interrupted may be half done, so it is repeated on resume
+        checkpoint(it)
+        log_f.close()
+        eval_f.close()
+        if view is not None:
+            view.close()
+        print(f"\nStopped at move {it * args.envs:,}. Saved to {run.resolve()}\n"
+              f"Continue with:  python train.py --resume {run}")
+        return
+
     final = greedy_eval(agent, nf, args.eval_games)
     evals.writerow([total_steps, round(time.time() - t0, 1), round(final, 2)])
-    eval_f.close()
     if final > best_avg:
         best_avg = final
         agent.save(run / "best.pth", games=len(games_log), moves=total_steps, eval_mean=final, record=record,
                    seconds=time.time() - t0)
     agent.save(run / "last.pth", games=len(games_log), moves=total_steps, record=record, seconds=time.time() - t0)
+    checkpoint(iters)
+    log_f.close()
+    eval_f.close()
     save_plot(games_log, run / "progress.png")
     print(f"Done in {(time.time() - t0) / 60:.1f} min · games {len(games_log):,} · "
           f"best greedy eval {best_avg:.1f} · record {record}\nSaved to {run.resolve()}")
